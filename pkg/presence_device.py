@@ -8,7 +8,7 @@ from .presence_property import PresenceProperty
 class PresenceDevice(Device):
     """network presence device type."""
 
-    def __init__(self, adapter, mac, name, details):
+    def __init__(self, adapter, _id, name, details):
         """
         Initialize the object.
 
@@ -18,15 +18,15 @@ class PresenceDevice(Device):
         index -- index inside parent device
         """
 
-        print()
-        print("+ DEVICE init: " + str(name))
-        Device.__init__(self, adapter, 'presence-{}'.format(mac))
+        
+        #Device.__init__(self, adapter, 'presence-{}'.format(mac))
+        Device.__init__(self, adapter, _id)
 
         self.adapter = adapter
         self.name = name
         self.description = "A device on the local network"
         self._type = ['BinarySensor']
-        self.properties = {}
+        #self.properties = {}
         #print("device self.properties at init: " + str(self.properties))
         #self.connected_notify(True)
 
@@ -39,10 +39,14 @@ class PresenceDevice(Device):
                 'readOnly': True,
             },
             str(details))
+            
+        if self.adapter.DEBUG:
+            print("+ Adding new device: " + str(name))
 
 
     def add_boolean_child(self, propertyID, new_description, new_value):
-        print("+ DEVICE.ADD_BOOLEAN_CHILD with id: " + str(propertyID))
+        if self.adapter.DEBUG:
+            print("+ DEVICE.ADD_BOOLEAN_CHILD with id: " + str(propertyID))
 
         self.properties[propertyID] = PresenceProperty(
             self,
@@ -65,7 +69,8 @@ class PresenceDevice(Device):
 
 
     def add_integer_child(self, propertyID, new_description, new_value):
-        print("+ DEVICE.ADD_INTEGER_CHILD with id: " + str(propertyID))
+        if self.adapter.DEBUG:
+            print("+ DEVICE.ADD_INTEGER_CHILD with id: " + str(propertyID))
 
         self.properties[propertyID] = PresenceProperty(
             self,

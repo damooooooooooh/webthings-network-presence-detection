@@ -6,16 +6,16 @@ import json
 import os
 import re
 import threading
+import time
+import subprocess
+import socket
 
 from .presence_device import PresenceDevice
-from .util import valid_ip, valid_mac, clamp, get_ip, ping, arping, arp
+from .util import *
 
-OUI_FILE = 'oui.txt'
-SEPARATORS = ('-', ':')
-BUFFER_SIZE = 1024 * 8
 
-__location__ = os.path.realpath(
-    os.path.join(os.getcwd(), os.path.dirname(__file__)))
+
+
 
 _CONFIG_PATHS = [
     os.path.join(os.path.expanduser('~'), '.mozilla-iot', 'config'),
@@ -28,372 +28,637 @@ if 'MOZIOT_HOME' in os.environ:
 class PresenceAdapter(Adapter):
     """Adapter for network presence detection"""
 
-    def __init__(self, verbose=True):
+    def __init__(self, verbose=False):
         """
         Initialize the object.
 
         verbose -- whether or not to enable verbose logging
         """
-        print("Initialising adapter from class")
-        self.pairing = False
+        #print("Initialising adapter from class")
+
+        self.addon_name = 'network-presence-detection-adapter'
         self.name = self.__class__.__name__
         Adapter.__init__(self,
-                         'network-presence-detection-adapter',
-                         'network-presence-detection-adapter',
+                         self.addon_name,
+                         self.addon_name,
                          verbose=verbose)
         #print("Adapter ID = " + self.get_id())
 
-        self.memory_in_weeks = 10 # How many weeks a device will be remembered as a possible device.
-        self.time_window = 60 # How many minutes should a device be away before we concider it away?
-        self.arping = False # Does the user also want to try using arping?
-
-        self.add_from_config() # Here we get data from the settings in the Gateway interface.
+        self.DEBUG = True
+        #self.memory_in_weeks = 10 # How many weeks a device will be remembered as a possible device.
+        self.time_window = 10 # How many minutes should a device be away before we consider it away?
 
         self.own_ip = 'unknown' # We scan only scan if the device itself has an IP address.
-        self.ip_range = {} # we remember which IP addresses had a device. This makes them extra interesting, and they will get extra attention during scans.
-        self.deep_scan_frequency = 10 # once every 10 scans we do a deep scan.
-        self.scan_count = 0 # Used by the deep scan system.
-        self.filename = None
+        
+        self.add_from_config() # Here we get data from the settings in the Gateway interface.
+           
+        #self.DEBUG = False
+           
+        try:
+            if self.own_ip == 'unknown':
+                self.own_ip = get_ip()
+        except:
+            print("Could not get actual own IP address")
+        
+     
+        self.should_brute_force_scan = True
+        self.busy_doing_brute_force_scan = False
+        self.last_brute_force_scan_time = 0             # Allows the add-on to start a brute force scan right away.
+        self.seconds_between_brute_force_scans = 120  #1800  # 30 minutes     
+        
+        self.running = True
+        self.saved_devices = []
 
-        for path in _CONFIG_PATHS:
-            if os.path.isdir(path):
-                self.filename = os.path.join(
-                    path,
-                    'network-presence-detection-adapter-devices.json'
-                )
+        self.addon_path =  os.path.join(os.path.expanduser('~'), '.mozilla-iot', 'addons', self.addon_name)
+        self.persistence_file_path = os.path.join(os.path.expanduser('~'), '.mozilla-iot', 'data', self.addon_name,'persistence.json')
 
+        if self.DEBUG:
+            print("self.persistence_file_path = " + str(self.persistence_file_path))
         self.should_save = False
 
-        # make sure the file exists:
-        if self.filename:
-            try:
-                with open(self.filename) as file_object:
-                    #print("Loading json..")
-                    try:
-                        self.previously_found = json.load(file_object)
-                    except:
-                        #print("Empty json file")
-                        self.previously_found = {}
-                    #print("Previously found items: = " + str(self.previously_found))
 
-            except (IOError, ValueError):
-                self.previously_found = {}
-                print("Failed to load JSON file, generating new one.")
-                with open(self.filename, 'w') as f:
-                    f.write('{}')
-        else:
+        try:
+            with open(self.persistence_file_path) as file_object:
+                #print("Loading json..")
+                try:
+                    self.previously_found = json.load(file_object)
+                except:
+                    #print("Empty json file")
+                    self.previously_found = {}
+                #print("Previously found items: = " + str(self.previously_found))
+
+        except (IOError, ValueError):
             self.previously_found = {}
-
-        # Remove devices that have not been seen in a long time
-        self.prune()
-
-        # Present all devices to the gateway
-        for key in self.previously_found:
-            self._add_device(str(key), str(self.previously_found[key]['name']), str('...')) # Adding the device
-
-            _id = 'presence-{}'.format(key)
-            self.devices[_id].add_boolean_child('recently1', "Recently spotted", False)
-            self.devices[_id].add_integer_child('minutes_ago', "Minutes ago last seen", 99999)
+            print("Failed to load JSON file, generating new one.")
+            try:
+                with open(self.persistence_file_path, 'w') as f:
+                    f.write('{}')
+            except Exception as ex:
+                print("failed to create empty persistence file: " + str(ex))
+        self.previous_found_devices_length = len(self.previously_found)
 
 
-        # Start the thread that updates the 'minutes ago' countdown on all lastseen properties.
-        #t = threading.Thread(target=self.update_minutes_ago)
-        #t.daemon = True
-        #t.start()
+        
+        # First scan
+        time.sleep(2) # wait a bit before doing the quick scan. The gateway will pre-populate based on the 'handle-device-saved' method.
+        self.arpa_scan() # get initial list of devices from arp -a
+
+        if self.DEBUG:
+            print("Starting the continous scan clock")
+        try:
+            t = threading.Thread(target=self.clock)
+            t.daemon = True
+            t.start()
+        except:
+            print("Error starting the continous light scan thread")
+
+        #done = self.brute_force_scan()
+
+        if self.DEBUG:
+            print("Starting the periodic brute force scan thread")
+        try:
+            b = threading.Thread(target=self.brute_force_scan)
+            b.daemon = True
+            b.start()
+        except:
+            print("Error starting the brute force scan thread")
+
+        
+        while self.running:
+            time.sleep(1)
+        
+        
+        
+        
+    def arpa_scan(self):
+        if self.DEBUG:
+            print("Initiating light scan using arp -a")
+        try:
+            arpa_list = self.arpa()
+            if self.DEBUG:
+                print("Arpa light scan results: " + str(arpa_list))
+                print("arpa list length: " + str(len(arpa_list)))
+                
+            for key in arpa_list:
+                if self.DEBUG:
+                    print("Analyzing ARPA item: " + str(arpa_list[key]))
+                
+                try:
+                    if key not in self.previously_found:
+                        if self.DEBUG:
+                            print("-Adding to previously found list")
+            
+                        self.previously_found[key] = {} # adding empty device to the previously found dictionary
+                        self.previously_found[key]['name'] = arpa_list[key]['name']
+                        self.previously_found[key]['arpa_time'] = time.time() #arpa_list[key]['arpa_time'] #timestamp of initiation
+                        #self.previously_found[key]['lastseen'] = 0 #arpa_list[key]['arpa_time'] #timestamp of initiation
+                        self.previously_found[key]['ip'] = arpa_list[key]['ip']
+                        self.previously_found[key]['mac_address'] = arpa_list[key]['mac_address']
+                        
+                        self.should_save = True # We will be adding this new device to the list, and then save that updated list.
+                        
+                    else:
+                        # Maybe we found a better name this time.
+                        if arpa_list[key]['name'] not in ("","?","unknown"): # superfluous?
+                            if self.DEBUG:
+                                print("ARPA scan may have found a better hostname, adding it to the previously_found devices dictionary")
+                            self.previously_found[key]['name'] = arpa_list[key]['name']
+                        
+                        try:
+                            self.previously_found[key]['ip'] = arpa_list[key]['ip']
+                        except:
+                            print("Error, could not update IP from arpa scan")
+                        
+                except Exception as ex:
+                    print("Error while analysing ARPA scan result item: " + str(ex))
+                    
+        except Exception as ex:
+            print("Error doing light arpa scan: " + str(ex))
+        
+        
+        
+    def brute_force_scan(self):
+        """ Goes over every possible IP adddress in the local network (1-254) to check if it responds to a ping or arping request """
+        while self.running:
+            if self.busy_doing_brute_force_scan == False and self.should_brute_force_scan == True:
+                if self.DEBUG:
+                    print("Initiating a brute force scan of the entire local network")
+                self.busy_doing_brute_force_scan = True
+                self.should_brute_force_scan = False
+                
+                try:
+                    # Remove devices that haven't been spotted in a long time.
+                    current_keys = self.previously_found.keys()
+                    for key in current_keys:
+                        try:
+                            if time.time() - self.previously_found[key]['arpa_time'] > 86400 and key not in self.saved_devices:
+                                if self.DEBUG:
+                                    print("Removing devices from found devices list because it hasn't been spotted in a day, and it's not a device the user has imported about.")
+                                del self.previously_found[key]
+                        except Exception as ex:
+                            if self.DEBUG:
+                                print("Could not remove old device: " + str(ex))
+                
+                
+                    if self.DEBUG:
+                        print("OWN IP = " + str(self.own_ip))
+                    if valid_ip(self.own_ip):
+                        #while True:
+                        #def split_processing(items, num_splits=4):
+                        old_previous_found_count = len(self.previously_found)
+                        thread_count = 5
+                        split_size = 51
+                        threads = []
+                        for i in range(thread_count):
+                            # determine the indices of the list this thread will handle
+                            start = i * split_size
+                            if self.DEBUG:
+                                print("thread start = " + str(start))
+                            # special case on the last chunk to account for uneven splits
+                            end = 255 if i+1 == thread_count else (i+1) * split_size
+                            if self.DEBUG:
+                                print("thread end = " + str(end))
+                            # Create the thread
+                            threads.append(
+                                threading.Thread(target=self.scan, args=(start, end)))
+                            threads[-1].daemon = True
+                            threads[-1].start() # start the thread we just created
+
+                        # Wait for all threads to finish
+                        for t in threads:
+                            t.join()
+
+                        if self.DEBUG:
+                            print("Deep scan: all threads are done")
+                        # If new devices were found, save the JSON file.
+                        if len(self.previously_found) > old_previous_found_count:
+                            self.should_save = True
+
+                        self.busy_doing_brute_force_scan = False
+                        self.last_brute_force_scan_time = time.time()
+                    
+                        if self.should_save: # This is the only time the json file is stored.    
+                            self.save_to_json()
+
+                except Exception as ex:
+                    print("Error doing brute force scan: " + str(ex))
+                    self.busy_doing_brute_force_scan == False
 
 
-        # We continuously scan for new devices, in an endless loop.
-        self.own_ip = get_ip()
-        if valid_ip(self.own_ip):
-            while True:
-                #def split_processing(items, num_splits=4):
-                old_previous_found_count = len(self.previously_found)
-                thread_count = 5
-                split_size = 255 // thread_count
-                threads = []
-                for i in range(thread_count):
-                    # determine the indices of the list this thread will handle
-                    start = i * split_size
-                    #print("thread start = " + str(start))
-                    # special case on the last chunk to account for uneven splits
-                    end = 255 if i+1 == thread_count else (i+1) * split_size
-                    #print("thread end = " + str(end))
-                    # Create the thread
-                    threads.append(
-                        threading.Thread(target=self.scan, args=(start, end)))
-                    threads[-1].daemon = True
-                    threads[-1].start() # start the thread we just created
 
-                # Wait for all threads to finish
-                for t in threads:
-                    t.join()
+    def clock(self):
+        """ Runs continuously and scans IP addresses that the user has accepted as things """
+        if self.DEBUG:
+            print("clock thread init")
+            
+        succesfully_found = 0 # If all devices the user cares about are actually present, then no deep scan is necessary.
+        while self.running:
 
-                # If new devices were found, save the JSON file.
-                if len(self.previously_found) > old_previous_found_count:
-                    self.save_to_json()
+            try:
+                if time.time() - self.last_brute_force_scan_time > self.seconds_between_brute_force_scans:
+                    self.last_brute_force_scan_time = time.time()
+                    if succesfully_found != len(self.saved_devices): # Avoid doing a deep scan if all devices are present
+                        self.should_brute_force_scan = True
+            except Exception as ex:
+                print("Clock: error running periodic deep scan: " + str(ex))
 
-                self.update_the_rest()
-                #self.scan()
-                #time.sleep(60)
+            succesfully_found = 0
+            try:
+                #if self.DEBUG:
+                    #print("")
+                    #print("CLOCK TICK")
+                        
 
-    '''
-    def update_minutes_ago(self):
-        t = threading.Timer(60.0, self.update_minutes_ago)
-        t.daemon = True
-        t.start()
+                
+                for key in self.previously_found:
+                    # Update device's last seen properties
+                    try:
+                        # Make sure all devices and properties exist. Should be superfluous really.
+                        #print("clock - str(key) = " + str(key) + " has " + str(self.previously_found[key]))
+                        if str(key) not in self.devices:
+                            
+                            #print(str(self.previously_found[str(key)]) + " was not turned into an internal devices object yet.")
+                            detail = "..."
+                            try:
+                                detail = self.previously_found[key]['ip']
+                            except:
+                                if self.DEBUG:
+                                    print("No IP address in previously found list (yet)")
+                                continue
+                                
+                            new_name = "Unknown"
+                            try:
+                                new_name = self.previously_found[key]['name']
+                            except:
+                                if self.DEBUG:
+                                    print("No name present in previously found list")
+                            
+                            if new_name == "Unknown" or new_name == "?" or new_name == "":
+                                if self.DEBUG:
+                                    print("No good name found yet, skipping device generation and update")
+                                continue
+                                
+                            self._add_device(key, new_name, detail) # The device did not exist yet, so we're creating it.
 
-        print("~~thread minutes ago updater")
-        #time.sleep(300)
-        for key in self.devices:
-            print("~~thread is checking out a device: " + str(key))
+                        try:
+                            if self.previously_found[key]['lastseen'] != 0 and self.previously_found[key]['lastseen'] != None:
+                                minutes_ago = int((time.time() - self.previously_found[key]['lastseen']) / 60)
+                            else:
+                                minutes_ago = 99999
+                        except Exception as ex:
+                            minutes_ago = 99999
+                            if self.DEBUG:
+                                print("Minutes ago issue: " + str(ex))
+                        
+                        try:
+                            if 'minutes_ago' not in self.devices[key].properties:
+                                if self.DEBUG:
+                                    print("+ Adding minutes ago property to presence device")
+                                self.devices[key].add_integer_child('minutes_ago', "Minutes ago last seen", minutes_ago)
+                            else:
+                                self.devices[key].properties['minutes_ago'].update(minutes_ago)
+                        except Exception as ex:
+                            print("Could not add minutes_ago property" + str(ex))
+                            
+                        try:
+                            if minutes_ago > self.time_window:
+                                recently = False
+                            else:
+                                recently = True
+                            if 'recently1' not in self.devices[key].properties:
+                                if self.DEBUG:
+                                    print("+ Adding recently spotted property to presence device")
+                                self.devices[key].add_boolean_child('recently1', "Recently spotted", recently)
+                            else:
+                                self.devices[key].properties['recently1'].update(recently)
+                        except Exception as ex:
+                            print("Could not add recently spotted property" + str(ex))
 
-            if 'minutes_ago' in self.devices[key].properties:
-                print("~~thread is updating minutes ago: " + str(key))
-                current_minutes_ago_value = self.devices[key].properties['minutes_ago'].value
-                self.devices[key].properties['minutes_ago'].update(current_minutes_ago_value + 1)
+                    except Exception as ex:
+                        print("Could not create or update property. Error: " + str(ex))    
+                    
+                    
+                # Scan the devices the user cares about
+                for key in self.saved_devices:
+                    if str(key) not in self.previously_found:
+                        if self.DEBUG:
+                            print("Saved thing was not found through scanning yet (not yet added to previously_found), skipping update attempt")
+                        continue
+                    if self.DEBUG:
+                        print("")
+                        print("CLOCK: key from saved devices:" + str(key))
 
-        #time.sleep(10)
-    '''
+                    if self.DEBUG:
+                        print("Saved device ID " + str(key) + " was also in previously found list. Trying scan.")
+                    
+                    # Try doing a Ping and then optionally an Arping request if there is a valid IP Address
+                    try:
+                        if self.DEBUG:
+                            print("IP from previously found list: " + str(self.previously_found[key]['ip']))
+                        if ping(self.previously_found[key]['ip'],1):
+                            if self.DEBUG:
+                                print(">> Ping could not find device at " + str(self.previously_found[key]['ip']) + ". Maybe Arping can.")
+                            try:
+                                if arping(self.previously_found[key]['ip'], 1) == 0:
+                                    self.previously_found[key]['lastseen'] = int(time.time())
+                                    if self.DEBUG:
+                                        print(">> Arping found it.")
+                                    succesfully_found += 1
+                                else:
+                                    if self.DEBUG:
+                                        print(">> Ping also could not find the device.")
+                            except Exception as ex:
+                                print("Error trying Arping: " + str(ex))
+                        else:
+                            if self.DEBUG:
+                                print(">> Ping found device")
+                            self.previously_found[key]['lastseen'] = int(time.time())
+                            succesfully_found += 1
+                        
+                    except Exception as ex:
+                        print("Was not able to scan device from saved_devices list: " + str(ex))
+                    
+                    
+            except Exception as ex:
+                print("Clock thread error: " + str(ex))
+            
+            time.sleep(5)
+
+
+
+    def handle_device_saved(self, device_id, device):
+        """User saved a thing. Also called when the add-on starts."""
+        if device_id.startswith('presence'):
+            if self.DEBUG:
+                print("handle_device_saved. device_id = " + str(device_id) + ", device = " + str(device))
+
+            if device_id not in self.saved_devices:
+                #print("Adding to saved_devices list: " + str(device_id.split("-")[1]))
+                if self.DEBUG:
+                    print("Added " + str(device['title']) + " to saved devices list")
+                    
+                original_title = "Unknown"
+                try:
+                    if str(device['title']) != "":
+                        original_title = str(device['title'])
+                except:
+                    print("Error getting original_title from data provided by the Gateway")
+                    
+                #self.saved_devices.append({device_id:{'name':original_title}})
+                self.saved_devices.append(device_id)
+                
+                try:
+                    #pass
+                    if device_id not in self.previously_found:
+                        if self.DEBUG:
+                            print("Populating previously_found from handle_device_saved")
+                        self.previously_found[device_id] = {}
+                        self.previously_found[device_id]['name'] = str(device['title'])
+                        self.previously_found[device_id]['lastseen'] = 0    
+                        self.previously_found[device_id]['arpa_time'] = int(time.time())
+                except Exception as ex:
+                    print("Error adding to found devices list: " + str(ex))
+
+
+
 
     def unload(self):
-        print("Presence detector is being unloaded")
+        """Add-on is shutting down."""
+        if self.DEBUG:
+            print("Network presence detector is being unloaded")
         self.save_to_json()
+        self.running = False
 
+
+
+    def remove_thing(self, device_id):
+        """User removed a thing from the interface."""
+        if self.DEBUG:
+            print("Removing presence detection device")
+
+        try:
+            #print("THING TO REMOVE:" + str(self.devices[device_id]))
+            del self.previously_found[device_id]
+            #print("2")
+            obj = self.get_device(device_id)
+            #print("3")
+            self.handle_device_removed(obj)
+            if self.DEBUG:
+                print("Succesfully removed presence detection device")
+        except:
+            print("Removing presence detection thing failed")
+        #del self.devices[device_id]
+        self.should_save = True # saving changes to the json persistence file
 
 
 
     def scan(self, start, end):
-        self.scan_count += 1
-        if self.scan_count == self.deep_scan_frequency:
-            self.scan_count = 0
+        """Part of the brute force scanning function, which splits out the scanning over multiple threads."""
+        #self.should_save = False # We only save found devices to a file if new devices have been found during this scan.
 
-        self.should_save = False # We only save found_devices to a file if new devices have been found during this scan.
-
+        # skip broadcast addresses
+        if start == 0:
+            start = 1
+        if end == 255:
+            end = 254
+            
         for ip_byte4 in range(start, end):
 
-            # when halfway through, start a new thread.
-
-
-
             ip_address = str(self.own_ip[:self.own_ip.rfind(".")]) + "." + str(ip_byte4)
-            #print()
-            #print(ip_address)
+            if self.DEBUG:
+                print(ip_address)
 
             # Skip our own IP address.
             if ip_address == self.own_ip:
                 continue
 
-            # IP Addresses that have been populated before get extra scrutiny.
-            if ip_address in self.ip_range:
-                ping_count = 4
-            else:
-                ping_count = 1
+            ping_count = 1
 
-            # Once in a while we do a deep scan of the entire network, and give each IP address a larger number of tries before moving on.
-            if self.scan_count == 0:
-                ping_count = 4
-
-            #print("-scan intensity: " + str(ping_count))
             alive = False   # holds whether we got any response.
             if ping(ip_address, ping_count) == 0: # 0 means everything went ok, so a device was found.
                 alive = True
-            elif self.arping:
-                if arping(ip_address, ping_count) == 0: # 0 means everything went ok, so a device was found.
-                    alive = True
-
-            # If either ping or arping found a device:
-            if alive:
-                self.ip_range[ip_address] = 1000 # This IP address is of high interest. For the next 1000 iterations is will get extra attention.
-                #print("-ALIVE")
-                output = arp(ip_address)
-                #print(str(output))
-                mac_addresses = re.findall(r'(([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2})', output)
-
-                now = datetime.timestamp(datetime.now())
-
-                if len(mac_addresses) > 0:
-                    mac_address = mac_addresses[0][0]
-                    mac_address = ':'.join([
-                        # Left pad the MAC address parts with '0' in case of
-                        # invalid output (as on macOS)
-                        '0' * (2 - len(x)) + x for x in mac_address.split(':')
-                    ])
-
-                    if not valid_mac(mac_address):
-                        continue
-
-                    mac_address = mac_address.replace(":", "")
-                    _id = 'presence-{}'.format(mac_address)
-                    #print("early mac = " + mac_address)
-
-                    # Get the basic variables
-                    found_device_name = output.split(' ')[0]
-                    #print("early found device name = " + found_device_name)
-
-                    if found_device_name == '?' or valid_ip(found_device_name):
-                        vendor = 'unnamed'
-                        try:
-                            # Get the vendor name, and shorten it. It removes
-                            # everything after the comma. Thus "Apple, inc"
-                            # becomes "Apple"
-                            vendor = get_vendor(mac_address)
-                            if vendor is not None:
-                                vendor = vendor.split(' ', 1)[0]
-                                vendor = vendor.split(',', 1)[0]
-                            else:
-                                vendor = 'unnamed'
-                        except ValueError:
-                            pass
-
-                        found_device_name = "Presence - " + vendor
-                    else:
-                        found_device_name = "Presence - " + found_device_name
-
-
-
-                        
-                    #print("--mac:  " + mac_address)
-                    #print("--name: " + found_device_name)
-                    #print("--_id: " + _id)
-                    
-                    # Create or update items in the previously_found dictionary
-                    try:
-                        possibleName = ''
-                        if mac_address not in self.previously_found:
-
-                            self.should_save = True
-
-                            i = 2 # We skip "1" as a number. So we will get names like "Apple" and then "Apple 2", "Apple 3", and so on.
-                            possibleName = found_device_name
-                            could_be_same_same = True
-
-                            while could_be_same_same is True: # We check if this name already exists in the list of previously found devices.
-                                could_be_same_same = False
-                                for item in self.previously_found.values():
-                                    if possibleName == item['name']: # The name already existed in the list, so we change it a little bit and compare again.
-                                        could_be_same_same = True
-                                        #print("names collided")
-                                        possibleName = found_device_name + " " + str(i)
-                                        i += 1
-
-                            self.previously_found[str(mac_address)] = {
-                                'name': str(possibleName),
-                                'lastseen': now,
-                            }
-                        else:
-                            #print(" -mac address already known")
-
-                            self.previously_found[mac_address]['lastseen'] = now
-                            possibleName = self.previously_found[mac_address]['name']
-                    except Exception as ex:
-                        print("Error updating items in the previously_found dictionary: " + str(ex))
-
-
-                    #print("--_id is now: " + _id)
-                    # Present new device to the WebThings gateway, or update them.
-                    
-                    #print("propos: " + str( self.get_devices() ))
-                    
-                    try:
-                        if _id not in self.devices:
-                            # Present new device to the WebThings gateway
-                            #print("not _id in self.devices")
-                            self._add_device(str(mac_address), str(possibleName), str(ip_address)) # The device did not exist yet, so we're creating it.
-                            #print("Presented new device to gateway:" + str(possibleName))
-                        else:
-                            if 'details' in self.devices[_id].properties:
-                                if ip_address != '':
-                                    #print("UPDATING DETAILS for " + _id)
-                                    self.devices[_id].properties['details'].update(str(ip_address))
-                                else:
-                                    pass
-                                    #print("ip_address was empty, so not updating the details property.")
-                            else:
-                                pass
-                                #print("The details property did not exist? Does the device even exist?")
-                    except Exception as ex:
-                        print("Error presenting new device to the WebThings gateway, or updating them.: " + str(ex))
-
-                    # Present new device properties to the WebThings gateway, or update them.
-                    try:
-                        if 'recently1' not in self.devices[_id].properties:
-                            # add the property
-                            print()
-                            print("While updating, noticed device did not yet have the recently spotted property. Adding now.")
-                            self.devices[_id].add_boolean_child('recently1', "Recently spotted", True)
-                        else:
-                            self.devices[_id].properties['recently1'].update(True)
-
-                        if 'minutes_ago' not in self.devices[_id].properties:
-                            # add the property
-                            print()
-                            print("While updating, noticed device did not yet have the minutes ago property. Adding now.")
-                            self.devices[_id].add_integer_child('minutes_ago', "Minutes ago last seen", 0)
-                        else:
-                            self.devices[_id].properties['minutes_ago'].update(0)
-                    except Exception as ex:
-                        print("Error presenting new device properties to the WebThings gateway, or updating them.: " + str(ex))
-
-
-            # If no device was found at this IP address:
             else:
-                if ip_address in self.ip_range:
-                    if self.ip_range[ip_address] == 0:
-                        self.ip_range.pop(ip_address)
-                    else:
-                        self.ip_range[ip_address] = self.ip_range[ip_address] - 1
-
-
-    def update_the_rest(self):
-        # We go over the list of ALL previously found devices, including the ones not found in the scan, and update them.
-        try:
-            #print()
-            #past = datetime.now() - timedelta(hours=1)
-            nowstamp = datetime.timestamp(datetime.now())
-            #past = datetime.now() - timedelta(minutes=self.time_window)
-            #paststamp = datetime.timestamp(past) # A moment in the past that we compare against.
-
-
-
-            for key in self.previously_found:
-                #print()
-                
-                _id = 'presence-{}'.format(key)
-                #print("Updating: " + str(_id))
-
                 try:
-                    # Make sure all devices and properties exist. Should be superfluous really.
-                    if _id not in self.devices:
-                        self._add_device(key, self.previously_found[key]['name'], '...') # The device did not exist yet, so we're creating it.
-                    if 'recently1' not in self.devices[_id].properties:
-                        self.devices[_id].add_boolean_child('recently1', "Recently spotted", False)
-                    if 'minutes_ago' not in self.devices[_id].properties:
-                        self.devices[_id].add_integer_child('minutes_ago', "Minutes ago last seen", 99999)
-
-                    # Update devices
-                    self.previously_found[key]['lastseen']
-
-                    minutes_ago = int((nowstamp - self.previously_found[key]['lastseen']) / 60)
-                    #minutes_ago = int( ( - paststamp) / 60 )
-                    if minutes_ago > self.time_window:
-                        #print("BYE! " + str(key) + " was last seen over " + str(self.time_window) + " ago")
-                        self.devices[_id].properties['recently1'].update(False)
-                        self.devices[_id].properties['minutes_ago'].update(99999) # It's not great, but what other options are there?
-                    else:
-                        #print("HI!  " + str(key) + " was spotted less than " + str(self.time_window) + " minutes ago")
-                        self.devices[_id].properties['recently1'].update(True)
-                        self.devices[_id].properties['minutes_ago'].update(minutes_ago)
-
+                    if arping(ip_address, ping_count) == 0: # 0 means everything went ok, so a device was found.
+                        alive = True
                 except Exception as ex:
-                    print("Could not create or update property. Error: " + str(ex))
+                    print("Error trying Arping: " + str(ex))
+                
+            # If either ping or arping found a device:
+            try:
+                if alive:
+                    output = arp(ip_address)
+                    if self.DEBUG:
+                        print(str(ip_address) + " IS ALIVE: " + str(output))
+                    mac_addresses = re.findall(r'(([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2})', output)
 
+                    now = int(time.time())
+
+                    if len(mac_addresses) > 0:
+                        mac_address = mac_addresses[0][0]
+                        mac_address = ':'.join([
+                            # Left pad the MAC address parts with '0' in case of
+                            # invalid output (as on macOS)
+                            '0' * (2 - len(x)) + x for x in mac_address.split(':')
+                        ])
+
+                        if not valid_mac(mac_address):
+                            if self.DEBUG:
+                                print("Deep scan: MAC address was not valid")
+                            continue
+
+                        mac_short = mac_address.replace(":", "")
+                        _id = 'presence-{}'.format(mac_short)
+                        if self.DEBUG:
+                            print("early mac = " + mac_address)
+
+                        # Get the basic variables
+                        found_device_name = output.split(' ')[0]
+                        if self.DEBUG:
+                            print("early found device name = " + found_device_name)
+                        
+                        try:
+                            possible_name = self.get_optimal_name(ip_address, found_device_name, mac_address)
+                        except:
+                            if self.DEBUG:
+                                print("Reverting to found_device_name instead of optimal name")
+                            possible_name = "Presence - " + str(found_device_name)
+                            
+                        if self.DEBUG:
+                            print("optimal possible name = " + possible_name)
+
+                        if _id not in self.previously_found:
+                            self.previously_found[str(_id)] = {} # adding it to the internal object
+                            
+
+                        if self.DEBUG:
+                            print("--mac:  " + mac_address)
+                            print("--name: " + possible_name)
+                            print("--_id: " + _id)
+                     
+                        self.previously_found[_id]['arpa_time'] = now # creation time
+                        self.previously_found[_id]['mac_address'] = mac_address
+                     
+                        self.previously_found[_id]['lastseen'] = now    
+                        self.previously_found[_id]['name'] = str(possible_name) # The name may be better, or it may have changed.
+                        self.previously_found[_id]['ip'] = ip_address
+                    
+            except Exception as ex:
+                print("Brute force scan: error updating items in the previously_found dictionary: " + str(ex))
+
+
+
+
+
+    def get_optimal_name(self,ip_address,found_device_name="",mac_address=""):
+
+        # Try to get hostname
+        nmb_result = ""
+        
+        #try:
+            #nmb_result = socket.gethostbyaddr(ip_address)
+            #nmb_result = hostname_lookup(ip_address)
+        #    nmb_result,alias,addresslist = hostname_lookup(ip_address)
+        #    print("socket.gethostbyaddr(ip_address) gave: " + str(nmb_result))
+        #except Exception as ex:
+        #    print("socket.gethostbyaddr(ip_address) error: " + str(ex))
+        
+        
+        try:
+            nmb_result = nmblookup(ip_address)
+            if self.DEBUG:
+                print("nmblookup result = " + str(nmb_result))
         except Exception as ex:
-            print("Error while updating device: " + str(ex))
+            if self.DEBUG:
+                print("Error doing nmblookup: " + str(ex))
+        
+        if nmb_result == "":
+            if self.DEBUG:
+                print("NMB lookup result was an empty string")
+                
+            # Round 2: analyse MAC address
+            if found_device_name == '?' or found_device_name == '' or valid_ip(found_device_name):
+            
+                vendor = 'unnamed'
+                try:
+                    # Get the vendor name, and shorten it. It removes
+                    # everything after the comma. Thus "Apple, inc"
+                    # becomes "Apple"
+                    vendor = get_vendor(mac_address)
+                    if vendor is not None:
+                        vendor = vendor.split(' ', 1)[0]
+                        vendor = vendor.split(',', 1)[0]
+                    else:
+                        vendor = 'unnamed'
+                except ValueError:
+                    pass
 
-        # Here we remove devices that haven't been spotted in a long time.
-        self.prune()
+                found_device_name = vendor
+                
+        else:
+            found_device_name = nmb_result
+               
+        # At this point we definitely have something.
+        
+        found_device_name = "Presence - " + found_device_name
+        possible_name = found_device_name
+        if self.DEBUG: 
+            print("--possible name (may be duplicate):  " + str(found_device_name))
+        
+        # Create or update items in the previously_found dictionary
+        try:
+            
+            mac_short = mac_address.replace(":", "")
+            _id = 'presence-{}'.format(mac_short)
+            
+            #for item in self.previously_found:
+                #if self.DEBUG:
+                #    print("ADDING NEW FOUND DEVICE TO FOUND DEVICES LIST")
+                #self.should_save = True # We will be adding this new device to the list, and then save that updated list.
 
+            i = 2 # We skip "1" as a number. So we will get names like "Apple" and then "Apple 2", "Apple 3", and so on.
+            #possible_name = found_device_name
+            could_be_same_same = True
 
+            while could_be_same_same is True: # We check if this name already exists in the list of previously found devices.
+                could_be_same_same = False
+                try:
+                    for key in self.previously_found:
+                        if self.DEBUG:
+                            print("-checking possible name '" + str(possible_name) + "' against: " + str(self.previously_found[key]['name']))
+                            print("--prev found device key = " + str(key))
+                        
+                        # We skip checking for name duplication if the potential new device is the exact same device, so it would be logical if they had the same name.
+                        if str(key) == str(_id):
+                            if self.DEBUG:
+                                print("key == _id")
+                            if possible_name == str(self.previously_found[key]['name']):
+                                if self.DEBUG:
+                                    print("the new name is the same as the old for this mac-address")
+                                #continue
+                                break
+                        
+                        if possible_name == str(self.previously_found[key]['name']): # The name already existed somewhere in the list, so we change it a little bit and compare again.
+                            could_be_same_same = True
+                            if self.DEBUG:
+                                print("-names collided: " + str(possible_name))
+                            possible_name = found_device_name + " " + str(i)
+                            if self.DEBUG:
+                                print("-now testing new name: " + str(possible_name))
+                            i += 1 # up the count for a potential next round
+                            if i > 200:
+                                if self.DEBUG:
+                                    print("Reached 200 limit in while loop") # if the user has 200 of the same device, that's incredible.
+                                break
+                except Exception as ex:
+                    print("Error doing name check in while loop: " + str(ex))
+        except Exception as ex:
+            print("Error in name duplicate check: " + str(ex))
+        
+        return possible_name
+        
+        
+        
 
     def _add_device(self, mac, name, details):
         """
@@ -414,48 +679,12 @@ class PresenceAdapter(Adapter):
 
 
 
-    def prune(self):
-        # adding already known devices back into the system. Maybe only devices seen in the last few months?
-
-        try:
-            print()
-            too_old = datetime.now() - timedelta(weeks=self.memory_in_weeks)
-            #print("Too old threshold: " + str(too_old))
-            too_old_timestamp = datetime.timestamp(too_old)
-
-            items_to_remove = []
-
-            for key in self.previously_found:
-                #print("Updating: " + str(key))# + "," + str(item))
-
-                item = self.previously_found[key]
-
-                #lastSpottedTime = datetime.strptime('Jun 1 2005  1:33PM', '%b %d %Y %I:%M%p')
-
-                if too_old_timestamp > item['lastseen']:
-                    print(str(key) + " was pruned from the list of all found devices")
-                    items_to_remove.append(key)
-                else:
-                    #print(str(key) + " was not too old")
-                    pass
-
-            if len(items_to_remove):
-                for remove_me in items_to_remove:
-                    self.previously_found.pop(remove_me, None)
-                    #del self.previously_found[remove_me]
-                self.save_to_json()
-
-        except Exception as ex:
-            print("Error pruning found devices list: " + str(ex))
-
-
 
     def add_from_config(self):
         """Attempt to add all configured devices."""
 
         try:
-            database = Database('network-presence-detection-adapter')
-
+            database = Database(self.addon_name)
 
             if not database.open():
                 return
@@ -463,69 +692,133 @@ class PresenceAdapter(Adapter):
             config = database.load_config()
             database.close()
 
-            if not config or 'Memory' not in config or 'Time window' not in config:
-                print("Required variables not found in config database?")
+            if not config or 'Time window' not in config:
+                print("Error: required variables not found in config database. Check the addon's settings.")
                 return
 
-            self.memory_in_weeks = clamp(int(config['Memory']), 1, 50) # The variable is clamped: it is forced to be between 1 and 50.
-            self.time_window = clamp(int(config['Time window']), 1, 1380) # 'Grace period' could also be a good name.
+            try:
+                self.DEBUG = bool(config['Debugging']) # The variable is clamped: it is forced to be between 1 and 50.
+            except:
+                print("No debugging preference was found in the settings")
+            
+            
+            # Target IP
+            # Can be used to override normal behaviour (which is to scan the controller's neighbours), and target a very different group of IP addresses.
+            if 'Target IP' in config:
+                try:
+                    if str(config['Target IP']) != "":
+                        potential_ip = str(config['Target IP'])
+                        if valid_ip(potential_ip):
+                            self.own_ip = potential_ip
+                            print("A target IP was in settings")
+                        else:
+                            print("This addon does not understand '" + str(potential_ip) + "' as a valid IP address. Go to the add-on settings page to fix this. For now, the addon will try to detect and use the system's IP address as a base instead.")
+                except:
+                    print("Error handling Target IP setting")
+            else:
+                if self.DEBUG:
+                    print("No target IP address was available in the settings data")
 
-            if 'Arping' in config:
-                self.arping = config['Arping'] # boolean.
-
-            print("Config loaded ok")
+            
+            
+            
+            
+            try:
+                self.time_window = clamp(int(config['Time window']), 1, 10800) # In minutes. 'Grace period' could also be a good name.
+                print("Time window value from settings page: " + str(self.time_window))
+            except:
+                print("No time window preference was found in the settings. Will use default.")
+            
+                
 
         except:
-            print("Error getting config data from database")
+            print("Error getting config data from database. Check the add-on's settings page for any issues.")
 
 
 
     def save_to_json(self):
+        """Save found devices to json file."""
         try:
-            print()
-            print("Saving updated list of found devices to json file")
-            if self.previously_found and self.filename:
-                with open(self.filename, 'w') as fp:
-                    json.dump(self.previously_found, fp)
-        except:
-            print("Saving to json file failed")
+            if self.DEBUG:
+                print("Saving updated list of found devices to json file")
+            #if self.previously_found:
+            #with open(self.persistence_file_path, 'w') as fp:
+                #json.dump(self.previously_found, fp)
+                
+            j = json.dumps(self.previously_found, indent=4) # Pretty printing to the file
+            f = open(self.persistence_file_path, 'w')
+            print(j, file=f)
+            f.close()
+                
+        except Exception as ex:
+            print("Saving to json file failed: " + str(ex))
+        self.should_save = False
 
 
+    def start_pairing(self, timeout):
+        """Starting the pairing process."""
+        self.arpa_scan()
+        self.should_brute_force_scan = True
 
     def cancel_pairing(self):
         """Cancel the pairing process."""
-        self.pairing = False
         self.save_to_json()
 
 
 
+        
+    def arpa(self):
+        command = "arp -a"
+        device_list = {}
+        try:
+            result = subprocess.run(command, shell=True, universal_newlines=True, stdout=subprocess.PIPE) #.decode())
+            for line in result.stdout.split('\n'):
+                if not "<incomplete>" in line and len(line) > 10:
+                    name = "?"
+                    mac_short = ""
+                    try:
+                        mac_address_list = re.findall(r'(([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2})', str(line))[0]
+                        #print(str(mac_address_list))
+                        mac_address = str(mac_address_list[0])
+                        #print(str(mac_address))
+                        mac_short = str(mac_address.replace(":", ""))
+                        _id = 'presence-{}'.format(mac_short)
+                    except Exception as ex:
+                        print("getting mac from arp -a line failed: " + str(ex))
+                    
+                    try:
+                        ip_address_list = re.findall(r'(?:\d{1,3}\.)+(?:\d{1,3})', str(line))
+                        #print("ip_address_list = " + str(ip_address_list))
+                        ip_address = str(ip_address_list[0])
+                        if not valid_ip(ip_address):
+                            continue
+                    except Exception as ex:
+                        print("no IP address in line: " + str(ex))
+                        
+                    try:
+                        found_device_name = str(line.split(' (')[0])
+                        
+                        possible_name = self.get_optimal_name(ip_address, found_device_name, mac_address)
+                        
+                        
+                    except Exception as ex:
+                        print("Error: could not get name from arp -a line: " + str(ex))
+                        
+                    if mac_short != "":
+                        #print("util: arp: mac in line: " + line)
+                        #item = {'ip':ip_address,'mac':mac_address,'name':name, 'mac_short':mac_address.replace(":", "")}
+                        #return str(line)
+                        
+                        device_list[_id] = {'ip':ip_address,'mac_address':mac_address,'name':possible_name,'arpa_time':int(time.time()),'lastseen':0}
+                        #print("device_list = " + str(device_list))
+            #return str(result.stdout)
 
-# I couldn't get the import to work, so I just copied some of the code here:
-# It was made by Victor Oliveira (victor.oliveira@gmx.com)
+        except Exception as ex:
+            print("Arp -a error: " + str(ex))
+            #result = 'error'
+        return device_list
+        #return str(subprocess.check_output(command, shell=True).decode())
 
 
-def get_vendor(mac, oui_file=OUI_FILE):
-    mac_clean = mac
-    for separator in SEPARATORS:
-        mac_clean = ''.join(mac_clean.split(separator))
 
-    try:
-        int(mac_clean, 16)
-    except ValueError:
-        raise ValueError('Invalid MAC address.')
 
-    mac_size = len(mac_clean)
-    if mac_size > 12 or mac_size < 6:
-        raise ValueError('Invalid MAC address.')
-
-    with open(os.path.join(__location__, oui_file)) as file:
-        mac_half = mac_clean[0:6]
-        mac_half_upper = mac_half.upper()
-        while True:
-            line = file.readline()
-            if line:
-                if line.startswith(mac_half_upper):
-                    vendor = line.strip().split('\t')[-1]
-                    return vendor
-            else:
-                break
